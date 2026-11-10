@@ -17,6 +17,7 @@ import { readdirSync, existsSync } from 'node:fs'
 import { homedir, platform } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { isUtf8 } from 'node:buffer'
 
 /** Keys matching this pattern carry AI conversation content worth scanning. */
 const AI_KEY_RE = /chat|composer|aiService|aichat|prompt|cursorai/i
@@ -144,7 +145,11 @@ export function discoverTargets() {
           try {
             const row = conn.prepare(`SELECT value FROM [${tbl}] WHERE key = ?`).get(k)
             if (!row) return ''
-            return row.value instanceof Uint8Array ? Buffer.from(row.value).toString('utf8') : String(row.value ?? '')
+            if (row.value instanceof Uint8Array) {
+              if (!isUtf8(row.value)) throw new Error('Cursor transcript BLOB is not valid UTF-8')
+              return Buffer.from(row.value).toString('utf8')
+            }
+            return String(row.value ?? '')
           } finally {
             conn.close()
           }

@@ -5,9 +5,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, delimiter } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { DatabaseSync } from 'node:sqlite'
@@ -213,6 +213,54 @@ test('malformed JSONL is skipped without writes or leaked parser context', () =>
   }
 })
 
+test('installed Stop hook alerts on valid findings even when another transcript is malformed', { skip: process.platform === 'win32' }, () => {
+  const { home } = makeHome()
+  try {
+    writeFileSync(join(home, '.claude', 'projects', 'demo', 'incomplete.jsonl'), '{"text":')
+    const scan = run(['scan', '--json', '--no-fail'], home)
+    assert.equal(scan.status, 1)
+    assert.equal(JSON.parse(scan.stdout).totalFindings, 1)
+    assert.equal(run(['install', '--yes'], home).status, 0)
+
+    const bin = join(home, 'bin')
+    mkdirSync(bin)
+    const fallback = join(home, 'fallback-used')
+    writeFileSync(join(bin, 'broom'), `#!${process.execPath}\nawait import(${JSON.stringify(BIN)})\n`)
+    writeFileSync(join(bin, 'npx'), `#!${process.execPath}\nimport { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(fallback)}, 'used'); process.exit(1)\n`)
+    for (const name of ['broom', 'npx']) chmodSync(join(bin, name), 0o755)
+    const hook = spawnSync(process.execPath, [join(home, '.claude', 'hooks', 'stop-broom.mjs')], {
+      env: { ...process.env, HOME: home, USERPROFILE: home, PATH: bin + delimiter + process.env.PATH }, encoding: 'utf8',
+    })
+    assert.equal(hook.status, 0)
+    assert.equal(JSON.parse(hook.stdout).decision, 'block')
+    assert.match(JSON.parse(hook.stdout).reason, /1 secret/)
+    assert.ok(!existsSync(fallback), 'valid partial output must not trigger the npx fallback')
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('CLI field-scoped extras find and redact credentials while preserving adjacent fields', () => {
+  const { home, file } = makeHome()
+  const credential = 'internal-credential-7712'
+  writeFileSync(file, JSON.stringify({ credential, keep: 7 }) + '\n')
+  const extra = join(home, 'extra.txt')
+  writeFileSync(extra, '/(?<="credential":\\s*")[^"]+/\n')
+  try {
+    const scan = run(['scan', '--json', '--extra', extra], home)
+    assert.equal(scan.status, 1)
+    assert.equal(JSON.parse(scan.stdout).totalFindings, 1)
+    const sweep = run(['sweep', '--extra', extra], home)
+    assert.equal(sweep.status, 1)
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    assert.match(parsed.credential, /^«BROOM:extra-0:/)
+    assert.equal(parsed.keep, 7)
+    assert.equal(run(['scan', '--extra', extra], home).status, 0)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('failed backups leave transcripts unchanged and fail despite --no-fail', () => {
   const { home, file } = makeHome()
   const original = readFileSync(file, 'utf8')
@@ -288,6 +336,22 @@ test('Cursor CLI scans, backs up and cleans real TEXT and BLOB rows', () => {
     const rescan = run(['scan', '--source', 'cursor', '--json'], home)
     assert.equal(rescan.status, 0)
     assert.equal(JSON.parse(rescan.stdout).totalFindings, 0)
+
+    const invalid = Buffer.concat([Buffer.from(`history ${SECRET} `), Buffer.from([0xff, 0xc3, 0x28])])
+    const writable = new DatabaseSync(file)
+    writable.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run('composer.invalid', invalid)
+    writable.close()
+    const rejected = run(['sweep', '--source', 'cursor', '--no-fail', '--json'], home)
+    assert.equal(rejected.status, 1)
+    assert.match(rejected.stderr, /not valid UTF-8/)
+    assert.ok(!rejected.stderr.includes(SECRET))
+    const unchanged = new DatabaseSync(file, { readOnly: true })
+    try {
+      assert.deepEqual(Buffer.from(unchanged.prepare('SELECT value FROM cursorDiskKV WHERE key = ?').get('composer.invalid').value), invalid)
+      assert.equal(Object.values(unchanged.prepare('PRAGMA quick_check').get())[0], 'ok')
+    } finally {
+      unchanged.close()
+    }
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

@@ -173,3 +173,30 @@ test('cursor writes fail if a discovered row disappears', (t) => {
     rmSync(home, { recursive: true, force: true })
   }
 })
+
+test('cursor rejects invalid UTF-8 BLOBs without changing their bytes', (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'broom-cursor-utf8-'))
+  const previousHome = process.env.HOME
+  process.env.HOME = home
+  try {
+    const root = cursorUserRoot()
+    if (!root.startsWith(home)) return t.skip('os.homedir() does not honor HOME here')
+    const storage = join(root, 'globalStorage')
+    mkdirSync(storage, { recursive: true })
+    const database = new DatabaseSync(join(storage, 'state.vscdb'))
+    try {
+      database.exec('CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)')
+      const original = Buffer.concat([Buffer.from(`before ${SECRET} after `), Buffer.from([0xff, 0xc3, 0x28])])
+      database.prepare('INSERT INTO ItemTable VALUES (?, ?)').run('composer.chat', original)
+      const [target] = discoverTargets()
+      assert.throws(() => target.read(), /UTF-8/)
+      assert.deepEqual(Buffer.from(database.prepare('SELECT value FROM ItemTable').get().value), original)
+    } finally {
+      database.close()
+    }
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME
+    else process.env.HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})

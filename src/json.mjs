@@ -65,27 +65,39 @@ export function assertJsonStructure(before, after, strictLines = false) {
     throw new Error('Redaction would change JSON structure or lose records')
   }
   for (let index = 0; index < original.length; index++) {
-    compareValues(original[index].value, redacted[index].value)
+    compareValues(original[index].value, redacted[index].value,
+      sourceKeys(original[index].text), sourceKeys(redacted[index].text))
   }
 }
 
-function compareValues(before, after) {
+// JSON.parse sorts integer-like keys. Keep source order for pairing entries
+// when redaction renames one of those keys to a non-integer placeholder.
+function* sourceKeys(text) {
+  const colon = /\s*:/y
+  for (const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"/g)) {
+    colon.lastIndex = match.index + match[0].length
+    if (colon.test(text)) yield JSON.parse(match[0])
+  }
+}
+
+function compareValues(before, after, originalKeys, redactedKeys) {
   const fail = () => { throw new Error('Redaction would change JSON structure or merge object entries') }
   if (typeof before === 'string') {
     if (typeof after !== 'string') fail()
     assertJsonStructure(before, after)
   } else if (Array.isArray(before)) {
     if (!Array.isArray(after) || before.length !== after.length) fail()
-    before.forEach((value, index) => compareValues(value, after[index]))
+    before.forEach((value, index) => compareValues(value, after[index], originalKeys, redactedKeys))
   } else if (before !== null && typeof before === 'object') {
     if (after === null || typeof after !== 'object' || Array.isArray(after)) fail()
-    const beforeKeys = Object.keys(before)
-    const afterKeys = Object.keys(after)
-    if (beforeKeys.length !== afterKeys.length) fail()
-    beforeKeys.forEach((key, index) => {
-      compareValues(key, afterKeys[index])
-      compareValues(before[key], after[afterKeys[index]])
-    })
+    const count = Object.keys(before).length
+    if (count !== Object.keys(after).length) fail()
+    for (let index = 0; index < count; index++) {
+      const key = originalKeys.next().value
+      const redactedKey = redactedKeys.next().value
+      compareValues(key, redactedKey, originalKeys, redactedKeys)
+      compareValues(before[key], after[redactedKey], originalKeys, redactedKeys)
+    }
   } else if (before !== after && !(typeof after === 'string' && /^«BROOM:[\w-]+:[a-f0-9]{8}»$/.test(after))) {
     fail()
   }

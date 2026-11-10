@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { RULES } from '../src/rules.mjs'
-import { scanText } from '../src/detector.mjs'
+import { scanText, scanJsonLines } from '../src/detector.mjs'
 import { redactText, buildPlaceholder } from '../src/redactor.mjs'
 
 const SECRET = 'ghp_' + '1234567890abcdefABCDEF1234567890abcd'
@@ -118,4 +118,87 @@ test('numeric extras keep pretty-printed JSON valid', () => {
   const original = JSON.stringify({ pin: 8765432190, keep: { count: 7 } }, null, 2)
   const result = clean(original, ['8765432190'])
   assert.deepEqual(JSON.parse(result.text), { pin: buildPlaceholder('extra-0', '8765432190'), keep: { count: 7 } })
+})
+
+test('field-scoped extra regexes retain JSON context, including serialized arguments', () => {
+  const credential = 'internal-credential-7712'
+  const extra = '/(?<="credential":\\s*")[^"]+/'
+  for (const value of [
+    { credential, keep: 7 },
+    { arguments: JSON.stringify({ credential, keep: 7 }) },
+  ]) {
+    const result = clean(JSON.stringify(value), [extra])
+    assert.equal(result.applied, 1)
+    const parsed = JSON.parse(result.text)
+    assert.deepEqual(parsed.arguments ? JSON.parse(parsed.arguments) : parsed, {
+      credential: buildPlaceholder('extra-0', credential), keep: 7,
+    })
+    assert.equal(scanText(result.text, RULES, [extra]).length, 0)
+  }
+})
+
+test('field-scoped extras safely redact escaped credential values', () => {
+  const original = '{"credential":"internal\\u002dcredential-7712","keep":7}'
+  const result = clean(original, ['/(?<="credential":")[^"]+/'])
+  assert.equal(result.applied, 1)
+  assert.deepEqual(JSON.parse(result.text), {
+    credential: buildPlaceholder('extra-0', 'internal-credential-7712'), keep: 7,
+  })
+})
+
+test('partial numeric extras leave non-string scalars intact', () => {
+  const original = JSON.stringify({ timestamp: 1700123456789, pin: 1234, text: 'id-1234' })
+  const result = clean(original, ['1234'])
+  assert.equal(result.applied, 2)
+  assert.deepEqual(JSON.parse(result.text), {
+    timestamp: 1700123456789, pin: buildPlaceholder('extra-0', '1234'),
+    text: `id-${buildPlaceholder('extra-0', '1234')}`,
+  })
+  assert.equal(JSON.parse(clean('{"arguments":"[1234,1700123456789]"}', ['1234']).text).arguments,
+    `["${buildPlaceholder('extra-0', '1234')}",1700123456789]`)
+})
+
+test('integer-like keys can be redacted in any source order without losing entries', () => {
+  for (const original of [
+    '{"keep":1,"1234":{"value":2},"other":false}',
+    '{"1234":{"value":2},"keep":1,"other":false}',
+    '{"5678":{"value":3},"1234":{"value":2},"keep":1}',
+  ]) {
+    const parsed = JSON.parse(clean(original, ['1234', '5678']).text)
+    assert.deepEqual(parsed[buildPlaceholder('extra-0', '1234')], { value: 2 })
+    assert.equal(parsed.keep, 1)
+    assert.equal(Object.keys(parsed).length, 3)
+    if (original.includes('5678')) assert.deepEqual(parsed[buildPlaceholder('extra-1', '5678')], { value: 3 })
+    else assert.equal(parsed.other, false)
+  }
+})
+
+test('discarding a cross-field match does not suppress a valid secret inside it', () => {
+  const original = JSON.stringify({ begin: '-----BEGIN PRIVATE KEY-----', text: SECRET, end: '-----END PRIVATE KEY-----' })
+  const result = clean(original)
+  assert.equal(result.applied, 1)
+  assert.deepEqual(JSON.parse(result.text), {
+    begin: '-----BEGIN PRIVATE KEY-----', text: buildPlaceholder('github-pat', SECRET), end: '-----END PRIVATE KEY-----',
+  })
+})
+
+test('a rejected PEM spanning fields cannot consume a complete PEM in a later field', () => {
+  const pem = '-----BEGIN PRIVATE KEY-----QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=-----END PRIVATE KEY-----'
+  const original = JSON.stringify({ begin: '-----BEGIN PRIVATE KEY-----', text: pem, keep: 7 })
+  const result = clean(original)
+  assert.equal(result.applied, 1)
+  assert.deepEqual(JSON.parse(result.text), {
+    begin: '-----BEGIN PRIVATE KEY-----', text: buildPlaceholder('private-key', pem), keep: 7,
+  })
+})
+
+test('rule regex setup does not scale with the number of JSON tokens or records', () => {
+  let reads = 0
+  class Pattern extends RegExp {
+    get source() { reads++; return super.source }
+  }
+  const rule = { id: 'test', title: 'test', severity: 'high', pattern: new Pattern('never-a-secret', 'gd') }
+  const text = (JSON.stringify({ role: 'user', text: 'ordinary text', keep: [1, true, null] }) + '\n').repeat(2000)
+  assert.deepEqual(scanJsonLines(text, [rule]), [])
+  assert.ok(reads <= 2, `pattern source read ${reads} times`)
 })
