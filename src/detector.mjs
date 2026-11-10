@@ -1,10 +1,11 @@
 // Scanner: runs rules against a text blob and returns de-overlapped findings.
 
 import { shannonEntropy } from './rules.mjs'
+import { jsonDocuments, mapJsonFindings } from './json.mjs'
 
 /**
  * @typedef {'critical'|'high'|'medium'|'low'} Severity
- * @typedef {{ ruleId:string, title:string, severity:Severity, secret:string, start:number, end:number }} Finding
+ * @typedef {{ ruleId:string, title:string, severity:Severity, secret:string, start:number, end:number, jsonDepth?:number }} Finding
  */
 
 const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
@@ -20,9 +21,47 @@ const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
  */
 export function scanText(text, rules, extras = []) {
   const allRules = [...rules, ...extrasToRules(extras)]
-  const raw = []
+  return scan(text, allRules)
+}
 
-  for (const rule of allRules) {
+export function scanJsonLines(text, rules, extras = []) {
+  const allRules = [...rules, ...extrasToRules(extras)]
+  return scanDocuments(jsonDocuments(text, true), allRules)
+}
+
+function scan(text, rules) {
+  const documents = jsonDocuments(text)
+  return documents ? scanDocuments(documents, rules) : scanRaw(text, rules)
+}
+
+function scanDocuments(documents, rules) {
+  const findings = []
+  const tokens = /"(?:\\[\s\S]|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/g
+  for (const document of documents) {
+    for (const match of document.text.matchAll(tokens)) {
+      const start = document.start + match.index
+      if (match[0][0] === '"') {
+        const decoded = JSON.parse(match[0])
+        for (const finding of mapJsonFindings(match[0], scan(decoded, rules), start)) findings.push(finding)
+      } else {
+        const found = scanRaw(match[0], rules).map(finding => ({
+          ...finding,
+          start,
+          end: start + match[0].length,
+          jsonDepth: 0,
+        }))
+        for (const finding of resolveOverlaps(found)) findings.push(finding)
+      }
+    }
+  }
+  return findings
+}
+
+function scanRaw(text, rules) {
+  const raw = []
+  const placeholders = [...text.matchAll(/«BROOM:[\w-]+:[a-f0-9]{8}»/g)]
+
+  for (const rule of rules) {
     // Clone the pattern so matchAll gets a fresh lastIndex each call.
     const pattern = new RegExp(rule.pattern.source, rule.pattern.flags)
 
@@ -34,6 +73,15 @@ export function scanText(text, rules, extras = []) {
       const indices = match.indices?.[grp] ?? match.indices?.[0]
       if (!indices) continue
       const [start, end] = indices
+
+      let low = 0
+      let high = placeholders.length - 1
+      while (low <= high) {
+        const middle = (low + high) >>> 1
+        if (placeholders[middle].index <= start) low = middle + 1
+        else high = middle - 1
+      }
+      if (high >= 0 && end <= placeholders[high].index + placeholders[high][0].length) continue
 
       if (rule.entropy !== undefined && shannonEntropy(secret) < rule.entropy) continue
       if (rule.deny && rule.deny.test(secret)) continue

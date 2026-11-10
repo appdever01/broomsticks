@@ -10,6 +10,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { DatabaseSync } from 'node:sqlite'
+import { scanText } from '../src/detector.mjs'
+import { redactText } from '../src/redactor.mjs'
+import { RULES } from '../src/rules.mjs'
 
 const BIN = fileURLToPath(new URL('../bin/broom.mjs', import.meta.url))
 const SECRET = 'ghp_1234567890abcdefABCDEF1234567890abcd'
@@ -25,7 +29,7 @@ function makeHome() {
 
 function run(args, home) {
   return spawnSync(process.execPath, [BIN, ...args], {
-    env: { ...process.env, HOME: home, USERPROFILE: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home, APPDATA: join(home, 'AppData', 'Roaming') },
     encoding: 'utf8',
   })
 }
@@ -137,6 +141,219 @@ test('broom proxy keeps running (does not fall through to scan and exit)', async
     child.kill('SIGTERM')
     await sleep(50)
     if (child.exitCode === null) child.kill('SIGKILL')
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+for (const source of ['claude-code', 'codex']) {
+  test(`${source}: escaped JSONL scan, backup, sweep and rescan preserve records`, () => {
+    const home = mkdtempSync(join(tmpdir(), 'broom-cli-json-'))
+    const directory = source === 'codex' ? join(home, '.codex', 'sessions') : join(home, '.claude', 'projects', 'demo')
+    mkdirSync(directory, { recursive: true })
+    const file = join(directory, 'session.jsonl')
+    const url = 'postgres://' + 'reader:Example123@database.example.invalid/app'
+    const records = [
+      { type: 'user', text: `connect("${url}")`, keep: [1, true, null] },
+      { type: 'assistant', arguments: JSON.stringify({ url, count: 3 }) },
+      { type: 'user', text: '-----BEGIN PRIVATE KEY-----', keep: 1 },
+      { type: 'assistant', text: '-----END PRIVATE KEY-----', keep: 2 },
+    ]
+    const original = records.map(record => JSON.stringify(record)).join('\r\n') + '\r\n'
+    writeFileSync(file, original)
+    try {
+      const scan = run(['scan', '--source', source, '--json'], home)
+      assert.equal(scan.status, 1)
+      assert.equal(JSON.parse(scan.stdout).totalFindings, 2)
+      assert.ok(!scan.stdout.includes(url))
+      assert.equal(readFileSync(file, 'utf8'), original)
+
+      const sweep = run(['sweep', '--source', source], home)
+      assert.equal(sweep.status, 1)
+      const after = readFileSync(file, 'utf8')
+      const parsed = after.trim().split('\r\n').map(line => JSON.parse(line))
+      assert.equal(parsed.length, records.length)
+      assert.deepEqual(parsed[0].keep, records[0].keep)
+      assert.ok(!parsed[0].text.includes(url))
+      assert.ok(JSON.parse(parsed[1].arguments).url.startsWith('«BROOM:db-url:'))
+      assert.deepEqual(parsed.slice(2), records.slice(2))
+
+      const root = join(home, '.broom', 'backups')
+      const stamps = readdirSync(root)
+      assert.equal(stamps.length, 1)
+      const manifest = JSON.parse(readFileSync(join(root, stamps[0], 'manifest.json'), 'utf8'))
+      assert.equal(readFileSync(manifest.files[0].backup, 'utf8'), original)
+
+      const rescan = run(['scan', '--source', source, '--json'], home)
+      assert.equal(rescan.status, 0)
+      assert.equal(JSON.parse(rescan.stdout).totalFindings, 0)
+      const repeated = run(['sweep', '--source', source], home)
+      assert.equal(repeated.status, 0)
+      assert.equal(readFileSync(file, 'utf8'), after)
+      assert.deepEqual(readdirSync(root), stamps)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+}
+
+test('malformed JSONL is skipped without writes or leaked parser context', () => {
+  const { home, file } = makeHome()
+  const original = readFileSync(file, 'utf8') + '{"text":"unterminated ' + SECRET
+  writeFileSync(file, original)
+  try {
+    const result = run(['sweep', '--source', 'claude-code', '--no-fail'], home)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /Invalid JSONL record on line 2/)
+    assert.doesNotMatch(result.stdout, /All .*chat.*clean/)
+    assert.ok(!result.stderr.includes(SECRET))
+    assert.equal(readFileSync(file, 'utf8'), original)
+    assert.ok(!existsSync(join(home, '.broom', 'backups')))
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('failed backups leave transcripts unchanged and fail despite --no-fail', () => {
+  const { home, file } = makeHome()
+  const original = readFileSync(file, 'utf8')
+  const backupDir = join(home, 'not-a-directory')
+  writeFileSync(backupDir, 'keep this file')
+  try {
+    const result = run(['sweep', '--source', 'claude-code', '--backup-dir', backupDir, '--no-fail'], home)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /cannot clean/)
+    assert.doesNotMatch(result.stdout, /originals backed up/)
+    assert.equal(readFileSync(file, 'utf8'), original)
+    assert.equal(readFileSync(backupDir, 'utf8'), 'keep this file')
+    assert.equal(JSON.parse(run(['scan', '--json'], home).stdout).totalFindings, 1)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('Cursor CLI scans, backs up and cleans real TEXT and BLOB rows', () => {
+  const home = mkdtempSync(join(tmpdir(), 'broom-cli-cursor-'))
+  const root = process.platform === 'darwin'
+    ? join(home, 'Library', 'Application Support', 'Cursor', 'User')
+    : process.platform === 'win32'
+      ? join(home, 'AppData', 'Roaming', 'Cursor', 'User')
+      : join(home, '.config', 'Cursor', 'User')
+  const storage = join(root, 'globalStorage')
+  mkdirSync(storage, { recursive: true })
+  const file = join(storage, 'state.vscdb')
+  const url = 'postgres://' + 'reader:Example123@database.example.invalid/app'
+  const database = new DatabaseSync(file)
+  database.exec('CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB); CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)')
+  const text = JSON.stringify({ text: `connect("${url}")`, keep: 7 })
+  const blob = JSON.stringify({ [JSON.stringify({ url })]: { text: SECRET, keep: true } })
+  database.prepare('INSERT INTO ItemTable VALUES (?, ?)').run('aichat.text', text)
+  database.prepare('INSERT INTO ItemTable VALUES (?, ?)').run('workbench.settings', 'keep this')
+  database.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run('composer.blob', Buffer.from(blob))
+  database.close()
+  try {
+    const scan = run(['scan', '--source', 'cursor', '--json'], home)
+    assert.equal(scan.status, 1)
+    assert.equal(JSON.parse(scan.stdout).totalFindings, 3)
+    assert.ok(!scan.stdout.includes(SECRET))
+    const sweep = run(['sweep', '--source', 'cursor'], home)
+    assert.equal(sweep.status, 1)
+    const saved = new DatabaseSync(file, { readOnly: true })
+    try {
+      const a = saved.prepare('SELECT value, typeof(value) AS kind FROM ItemTable WHERE key = ?').get('aichat.text')
+      const b = saved.prepare('SELECT value, typeof(value) AS kind FROM cursorDiskKV WHERE key = ?').get('composer.blob')
+      assert.equal(a.kind, 'text')
+      assert.equal(b.kind, 'blob')
+      assert.equal(JSON.parse(a.value).keep, 7)
+      const parsed = JSON.parse(Buffer.from(b.value).toString('utf8'))
+      assert.equal(Object.keys(parsed).length, 1)
+      assert.ok(JSON.parse(Object.keys(parsed)[0]).url.startsWith('«BROOM:db-url:'))
+      assert.equal(Object.values(parsed)[0].keep, true)
+      assert.ok(!Buffer.from(b.value).toString('utf8').includes(SECRET))
+      assert.equal(saved.prepare('SELECT value FROM ItemTable WHERE key = ?').get('workbench.settings').value, 'keep this')
+      assert.equal(Object.values(saved.prepare('PRAGMA quick_check').get())[0], 'ok')
+    } finally {
+      saved.close()
+    }
+    const backups = join(home, '.broom', 'backups')
+    const stamp = readdirSync(backups)[0]
+    const manifest = JSON.parse(readFileSync(join(backups, stamp, 'manifest.json'), 'utf8'))
+    assert.equal(manifest.files.length, 1)
+    const backup = new DatabaseSync(manifest.files[0].backup, { readOnly: true })
+    try {
+      assert.equal(backup.prepare('SELECT value FROM ItemTable WHERE key = ?').get('aichat.text').value, text)
+      assert.equal(Buffer.from(backup.prepare('SELECT value FROM cursorDiskKV WHERE key = ?').get('composer.blob').value).toString('utf8'), blob)
+    } finally {
+      backup.close()
+    }
+    const rescan = run(['scan', '--source', 'cursor', '--json'], home)
+    assert.equal(rescan.status, 0)
+    assert.equal(JSON.parse(rescan.stdout).totalFindings, 0)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('decoded allowlist values remain untouched while other secrets are cleaned', () => {
+  const { home, file } = makeHome()
+  const url = 'postgres://' + 'reader:Example123@database.example.invalid/app'
+  const original = JSON.stringify({ text: `connect("${url}") key ${SECRET}` }) + '\n'
+  const allowlist = join(home, 'allowlist.txt')
+  writeFileSync(file, original)
+  writeFileSync(allowlist, url + '\n')
+  try {
+    const result = run(['sweep', '--source', 'claude-code', '--allowlist', allowlist], home)
+    assert.equal(result.status, 1)
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    assert.ok(parsed.text.includes(url))
+    assert.ok(!parsed.text.includes(SECRET))
+    const rescan = run(['scan', '--json', '--allowlist', allowlist], home)
+    assert.equal(rescan.status, 0)
+    assert.equal(JSON.parse(rescan.stdout).totalFindings, 0)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('unsafe key collisions leave the transcript unchanged and create no backup', () => {
+  const { home, file } = makeHome()
+  const { text: placeholder } = redactText(SECRET, scanText(SECRET, RULES))
+  const original = JSON.stringify({ [SECRET]: 1, [placeholder]: 2 }) + '\n'
+  writeFileSync(file, original)
+  try {
+    const result = run(['sweep', '--source', 'claude-code', '--no-fail', '--json'], home)
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /JSON structure|object entries/)
+    assert.ok(!result.stderr.includes(SECRET))
+    assert.equal(JSON.parse(result.stdout).files[0].applied, 0)
+    assert.equal(readFileSync(file, 'utf8'), original)
+    assert.ok(!existsSync(join(home, '.broom', 'backups')))
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('partial backup failures retain a manifest for successful files', () => {
+  const { home, file } = makeHome()
+  const first = join(home, '.claude', 'projects', 'demo', 'a.jsonl')
+  const second = join(home, '.claude', 'projects', 'demo', 'b.jsonl')
+  const original = JSON.stringify({ text: SECRET }) + '\n'
+  writeFileSync(first, original)
+  writeFileSync(second, original)
+  rmSync(file)
+  const backupDir = join(home, 'backups')
+  const blockedDestination = join(backupDir, second.replace(/^[a-zA-Z]:/, '').replace(/^[\\/]+/, ''))
+  mkdirSync(blockedDestination, { recursive: true })
+  try {
+    const result = run(['sweep', '--source', 'claude-code', '--backup-dir', backupDir, '--no-fail'], home)
+    assert.equal(result.status, 1)
+    assert.ok(!readFileSync(first, 'utf8').includes(SECRET))
+    assert.equal(readFileSync(second, 'utf8'), original)
+    const manifest = JSON.parse(readFileSync(join(backupDir, 'manifest.json'), 'utf8'))
+    assert.equal(manifest.files.length, 1)
+    assert.equal(manifest.files[0].original, first)
+    assert.equal(readFileSync(manifest.files[0].backup, 'utf8'), original)
+    assert.equal(manifest.redactionSummary.find(row => row.label === second).applied, 0)
+  } finally {
     rmSync(home, { recursive: true, force: true })
   }
 })
